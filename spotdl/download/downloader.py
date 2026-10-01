@@ -2,6 +2,8 @@
 Downloader module, this is where all the downloading pre/post processing happens etc.
 """
 
+# pylint: disable=too-many-lines
+
 import asyncio
 import datetime
 import json
@@ -20,6 +22,7 @@ from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
 from spotdl.download.progress_handler import ProgressHandler
 from spotdl.providers.audio import (
     AudioProvider,
+    AudioProviderError,
     BandCamp,
     Piped,
     SoundCloud,
@@ -43,7 +46,12 @@ from spotdl.utils.formatter import create_file_name
 from spotdl.utils.lrc import generate_lrc
 from spotdl.utils.m3u import gen_m3u_files
 from spotdl.utils.metadata import MetadataError, embed_metadata
-from spotdl.utils.search import gather_known_songs, reinit_song, songs_from_albums
+from spotdl.utils.search import (
+    gather_known_songs,
+    is_matching_song_file,
+    reinit_song,
+    songs_from_albums,
+)
 
 __all__ = [
     "AUDIO_PROVIDERS",
@@ -163,6 +171,7 @@ class Downloader:
         # Gather already present songs
         self.scan_formats = self.settings["detect_formats"] or [self.settings["format"]]
         self.known_songs: Dict[str, List[Path]] = {}
+        self._claimed_paths: Dict[Path, str] = {}
         if self.settings["scan_for_songs"]:
             logger.info("Scanning for known songs, this might take a while...")
             for scan_format in self.scan_formats:
@@ -395,6 +404,110 @@ class Downloader:
 
         raise LookupError(f"No results found for song: {song.display_name}")
 
+    def search_primaries(self, song: Song) -> List[str]:
+        """
+        Search for the best match of a song in every audio provider.
+
+        ### Arguments
+        - song: The song to search for.
+
+        ### Returns
+        - list with the best url found by each provider, may be empty.
+        """
+
+        primaries: List[str] = []
+
+        for audio_provider in self.audio_providers:
+            try:
+                primary = audio_provider.search(
+                    song, self.settings["only_verified_results"]
+                )
+                if primary is not None:
+                    primaries.append(primary)
+            except Exception as exc:
+                logger.debug(
+                    "Search failed in %s for %s: %s",
+                    audio_provider.name,
+                    song.display_name,
+                    exc,
+                )
+
+        return list(dict.fromkeys(primaries))
+
+    def search_secondaries(self, song: Song) -> List[str]:
+        """
+        Get every search result from all audio providers.
+
+        ### Arguments
+        - song: The song to search for.
+
+        ### Returns
+        - list of result urls, used when the primary matches fail to download.
+        """
+        search_query = f"{song.name} {song.artist or ''}".strip()
+        secondaries: List[str] = []
+        only_verified = self.settings["only_verified_results"]
+        for audio_provider in self.audio_providers:
+            try:
+                search_results = audio_provider.get_results(search_query)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to get secondary results from %s for %s: %s",
+                    audio_provider.name,
+                    song.display_name,
+                    exc,
+                )
+                continue
+            secondaries.extend(
+                result.url
+                for result in search_results
+                if result.verified or not only_verified
+            )
+        return list(dict.fromkeys(secondaries))
+
+    @staticmethod
+    def _download_first_candidate(
+        audio_downloader: Union[AudioProvider, Piped], urls: List[str], song: Song
+    ) -> Tuple[Optional[Dict], Optional[str], Optional[AudioProviderError]]:
+        last_error = None
+        for url in urls:
+            logger.debug("Downloading %s using %s", song.display_name, url)
+            try:
+                return (
+                    audio_downloader.get_download_metadata(url, download=True),
+                    url,
+                    None,
+                )
+            except AudioProviderError as exc:
+                logger.info(
+                    "yt-dlp failed for %s, trying the next result: %s", url, exc
+                )
+                last_error = exc
+        return None, None, last_error
+
+    async def _claim_output_file(self, song: Song, output_file: Path) -> Path:
+        loop = asyncio.get_running_loop()
+        candidate = output_file
+        counter = 1
+        while True:
+            claimed_by_other = self._claimed_paths.get(candidate, song.url) != song.url
+            if not claimed_by_other and (
+                not candidate.exists()
+                or await loop.run_in_executor(
+                    None,
+                    is_matching_song_file,
+                    candidate,
+                    song,
+                    self.settings["id3_separator"],
+                )
+            ):
+                self._claimed_paths[candidate] = song.url
+                return candidate
+            candidate = output_file.with_name(
+                f"{output_file.stem} ({counter}){output_file.suffix}"
+            )
+            counter += 1
+
     def search_lyrics(self, song: Song) -> Optional[str]:
         """
         Search for lyrics using all available providers.
@@ -407,7 +520,17 @@ class Downloader:
         """
 
         for lyrics_provider in self.lyrics_providers:
-            lyrics = lyrics_provider.get_lyrics(song.name, song.artists)
+            try:
+                lyrics = lyrics_provider.get_lyrics(song.name, song.artists)
+            except Exception as exc:
+                logger.debug(
+                    "%s raised an error for %s: %s",
+                    lyrics_provider.name,
+                    song.display_name,
+                    exc,
+                )
+                continue
+
             if lyrics:
                 logger.debug(
                     "Found lyrics for %s on %s", song.display_name, lyrics_provider.name
@@ -507,6 +630,8 @@ class Downloader:
             file_name_length=self.settings["max_filename_length"],
         )
 
+        output_file = await self._claim_output_file(song, output_file)
+
         if song.explicit is True and self.settings["skip_explicit"] is True:
             logger.info("Skipping explicit song: %s", song.display_name)
             return song, None
@@ -531,12 +656,23 @@ class Downloader:
             ]
 
             # Checking if file already exists in all subfolders of output directory
-            file_exists = output_file.exists() or dup_song_paths
+            file_exists = output_file.exists() or bool(dup_song_paths)
             if not self.settings["scan_for_songs"]:
                 for file_extension in self.scan_formats:
                     ext_path = output_file.with_suffix(f".{file_extension}")
-                    if ext_path.exists():
-                        dup_song_paths.append(ext_path)
+                    if (
+                        ext_path.exists()
+                        and ext_path.absolute() != output_file.absolute()
+                    ):
+                        matches_ext = await loop.run_in_executor(
+                            None,
+                            is_matching_song_file,
+                            ext_path,
+                            song,
+                            self.settings["id3_separator"],
+                        )
+                        if matches_ext:
+                            dup_song_paths.append(ext_path)
 
             if dup_song_paths:
                 logger.debug(
@@ -592,21 +728,8 @@ class Downloader:
                             exc,
                         )
 
-            # Find song lyrics and add them to the song object
-            try:
-                lyrics = await loop.run_in_executor(None, self.search_lyrics, song)
-                if lyrics is None:
-                    logger.debug(
-                        "No lyrics found for %s, lyrics providers: %s",
-                        song.display_name,
-                        ", ".join(
-                            [lprovider.name for lprovider in self.lyrics_providers]
-                        ),
-                    )
-                else:
-                    song.lyrics = lyrics
-            except Exception as exc:
-                logger.debug("Could not search for lyrics: %s", exc)
+            # Search for lyrics while the audio is being downloaded
+            lyrics_future = loop.run_in_executor(None, self.search_lyrics, song)
 
             # If the file already exists and we want to overwrite the metadata,
             # we can skip the download
@@ -657,6 +780,8 @@ class Downloader:
 
                     return song, None
 
+                song.lyrics = await lyrics_future or song.lyrics
+
                 # Update the metadata
                 await loop.run_in_executor(
                     None,
@@ -706,28 +831,51 @@ class Downloader:
             )
 
             if song.download_url is None:
-                display_progress_tracker.notify_searching()
-                download_url = await loop.run_in_executor(None, self.search, song)
+                provider_name = (
+                    self.audio_providers[0].name
+                    if self.audio_providers
+                    else "audio provider"
+                )
+                display_progress_tracker.notify_searching(provider_name)
+                candidate_urls = await loop.run_in_executor(
+                    None, self.search_primaries, song
+                )
             else:
-                download_url = song.download_url
+                candidate_urls = [song.download_url]
 
             display_progress_tracker.notify_getting_meta()
 
-            logger.debug("Downloading %s using %s", song.display_name, download_url)
-            download_info = await loop.run_in_executor(
+            download_info, download_url, last_error = await loop.run_in_executor(
                 None,
-                lambda: audio_downloader.get_download_metadata(
-                    download_url, download=True
-                ),
+                self._download_first_candidate,
+                audio_downloader,
+                candidate_urls,
+                song,
             )
 
-            if download_info is None:
-                logger.debug(
-                    "No download info found for %s, url: %s",
+            # Fall back to the remaining search results when every primary match failed
+            if download_info is None and song.download_url is None:
+                logger.info(
+                    "Every primary match failed for %s, trying the other results",
                     song.display_name,
-                    download_url,
                 )
+                secondary_urls = await loop.run_in_executor(
+                    None, self.search_secondaries, song
+                )
+                download_info, download_url, fallback_error = (
+                    await loop.run_in_executor(
+                        None,
+                        self._download_first_candidate,
+                        audio_downloader,
+                        [url for url in secondary_urls if url not in candidate_urls],
+                        song,
+                    )
+                )
+                last_error = fallback_error or last_error
 
+            if download_info is None:
+                if last_error:
+                    raise last_error
                 raise DownloaderError(
                     f"yt-dlp failed to get metadata for: {song.name} - {song.artist}"
                 )
@@ -863,6 +1011,8 @@ class Downloader:
                     for file_to_delete in files_to_delete:
                         Path(file_to_delete).unlink()
 
+            song.lyrics = await lyrics_future or song.lyrics
+
             try:
                 await loop.run_in_executor(
                     None,
@@ -905,4 +1055,5 @@ class Downloader:
             self.errors.append(
                 f"{song.url} - {exception.__class__.__name__}: {exception}"
             )
+
             return song, None

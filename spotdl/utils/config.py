@@ -10,7 +10,7 @@ import os
 import platform
 from argparse import Namespace
 from pathlib import Path
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from spotdl.types.options import (
     DownloaderOptions,
@@ -22,6 +22,8 @@ from spotdl.types.options import (
 __all__ = [
     "ConfigError",
     "get_spotdl_path",
+    "get_configured_data_dir",
+    "set_configured_data_dir",
     "get_config_file",
     "get_cache_path",
     "get_temp_path",
@@ -45,6 +47,47 @@ class ConfigError(Exception):
     """
 
 
+def _data_dir_pointer_file() -> Path:
+    return Path.home() / ".spotdl_data_location"
+
+
+def get_configured_data_dir() -> Optional[Path]:
+    """
+    Get the data directory chosen during setup.
+
+    ### Returns
+    - The directory, or None if none was chosen or it no longer exists.
+    """
+
+    pointer_file = _data_dir_pointer_file()
+    if not pointer_file.is_file():
+        return None
+
+    try:
+        raw_path = pointer_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    if not raw_path:
+        return None
+
+    configured_path = Path(raw_path)
+    return configured_path if configured_path.is_dir() else None
+
+
+def set_configured_data_dir(path: Path) -> None:
+    """
+    Remember `path` as the data directory, creating it if needed.
+
+    ### Arguments
+    - path: The data directory.
+    """
+
+    resolved_path = path.expanduser().resolve()
+    os.makedirs(resolved_path, exist_ok=True)
+    _data_dir_pointer_file().write_text(str(resolved_path), encoding="utf-8")
+
+
 def get_spotdl_path() -> Path:
     """
     Get the path to the spotdl folder, following XDG standards on Linux.
@@ -53,9 +96,11 @@ def get_spotdl_path() -> Path:
 
     ### Returns
     - The path to the spotdl folder.
-
-    ### Notes
     """
+
+    configured_path = get_configured_data_dir()
+    if configured_path is not None:
+        return configured_path
 
     # For Linux systems, we follow the XDG Base Directory Specification
     if platform.system() == "Linux":
@@ -259,9 +304,15 @@ def create_settings(
     spotify_options = SpotifyOptions(
         **create_settings_type(arguments, config, SPOTIFY_OPTIONS)  # type: ignore
     )
-    downloader_options = DownloaderOptions(
-        **create_settings_type(arguments, config, DOWNLOADER_OPTIONS)  # type: ignore
-    )
+    downloader_dict = create_settings_type(arguments, config, DOWNLOADER_OPTIONS)
+    fallback_audio = getattr(arguments, "fallback_audio_provider", None)
+    if fallback_audio:
+        current_providers = list(downloader_dict.get("audio_providers", []))
+        if fallback_audio not in current_providers:
+            current_providers.append(fallback_audio)
+        downloader_dict["audio_providers"] = current_providers
+
+    downloader_options = DownloaderOptions(**downloader_dict)  # type: ignore
     web_options = WebOptions(**create_settings_type(arguments, config, WEB_OPTIONS))  # type: ignore
 
     return spotify_options, downloader_options, web_options

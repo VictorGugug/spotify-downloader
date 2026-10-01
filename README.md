@@ -130,6 +130,10 @@ For a list of all **options** use ```spotdl -h```
 <details>
 <summary style="font-size:1em"><strong>Supported operations</strong></summary>
 
+- `interactive`: Starts an interactive terminal interface to pick the songs and options. Running `spotdl` without arguments in a terminal also opens it. See [Interactive mode](docs/TUI_USER_GUIDE.md).
+    - Usage:
+        `spotdl interactive [query]`
+
 - `save`: Saves only the metadata from Spotify without downloading anything.
     - Usage:
         `spotdl save [query] --save-file {filename}.spotdl`
