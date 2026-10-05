@@ -121,16 +121,6 @@ class AudioProvider:
             "cookiefile": self.cookie_file,
             "outtmpl": str((get_temp_path() / "%(id)s.%(ext)s").resolve()),
             "retries": 5,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "web"],
-                },
-            },
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
         }
 
         yt_dlp_options.update(get_local_deno_yt_dlp_options())
