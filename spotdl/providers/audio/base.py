@@ -121,6 +121,11 @@ class AudioProvider:
             "cookiefile": self.cookie_file,
             "outtmpl": str((get_temp_path() / "%(id)s.%(ext)s").resolve()),
             "retries": 5,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web"],
+                },
+            },
         }
 
         yt_dlp_options.update(get_local_deno_yt_dlp_options())
